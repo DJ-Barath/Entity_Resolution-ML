@@ -128,7 +128,6 @@ def build_index(embeddings):
 
     # this is HNSW embedding
     # faiss.normalize_L2(embeddings)
-
     # index = faiss.IndexHNSWFlat(
     #     dimension, config.M
     # )
