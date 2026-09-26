@@ -1,0 +1,15 @@
+
+# exclude the datasets
+Dataset/
+Sample_Dataset/
+PreProcessedSample/
+
+# exclude the Models
+Models/
+sentence-transformers/
+
+# ignoring the virutal environment
+venv/
+
+# ignoring the pycache
+code/__pycache__/
