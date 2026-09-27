@@ -48,10 +48,12 @@ def get_feature_text(record, column):
     The feature is converted to a stripped string.
     """
 
-    return record.get(
-        column,
-        ""
-    ).strip()
+    value = record.get(column, "")
+
+    if value is None:
+        return ""
+
+    return str(value).strip()
 
 
 def normalize_embeddings(embeddings):
@@ -67,9 +69,10 @@ def normalize_embeddings(embeddings):
         dtype=np.float32
     )
 
-    faiss.normalize_L2(
-        embeddings
-    )
+    if embeddings.size == 0:
+        return embeddings
+
+    faiss.normalize_L2(embeddings)
 
     return embeddings
 
@@ -115,24 +118,38 @@ def encode_feature(records, column, model):
 
 def build_index(embeddings):
     """
-    Build a FAISS cosine-similarity index
-    from normalized embeddings.
+    Build an HNSW FAISS index using cosine similarity.
+
+    Embeddings must already be L2 normalized.
     """
+
+    if embeddings.ndim != 2:
+        raise ValueError(
+            "Embeddings must be a 2-dimensional array."
+        )
 
     dimension = embeddings.shape[1]
 
-    # Flat indexing
-    index = faiss.IndexFlatIP(
-        dimension
+    # Explicitly use Inner Product.
+    #
+    # Since embeddings are L2-normalized:
+    #
+    #     Inner Product == Cosine Similarity
+    #
+    index = faiss.IndexHNSWFlat(
+        dimension,
+        config.M
     )
 
-    # this is HNSW embedding
-    # faiss.normalize_L2(embeddings)
-    # index = faiss.IndexHNSWFlat(
-    #     dimension, config.M
-    # )
-    
-    # index.metric_type = faiss.METRIC_INNER_PRODUCT
+    index.metric_type = config.METRIC
+
+    index.hnsw.efConstruction = (
+        config.EF_CONSTRUCTION
+    )
+
+    index.hnsw.efSearch = (
+        config.EF_SEARCH
+    )
 
     index.add(
         embeddings
@@ -140,6 +157,10 @@ def build_index(embeddings):
 
     return index
 
+
+# ============================================================
+# Feature Index Construction
+# ============================================================
 
 def build_feature_indexes(
     s1_records,
@@ -152,11 +173,25 @@ def build_feature_indexes(
         address
         country
 
+    Also retain the normalized S1 embeddings.
+
     Returns:
+
         {
-            "name": name_index,
-            "address": address_index,
-            "country": country_index
+            "name": {
+                "index": ...,
+                "embeddings": ...
+            },
+
+            "address": {
+                "index": ...,
+                "embeddings": ...
+            },
+
+            "country": {
+                "index": ...,
+                "embeddings": ...
+            }
         }
     """
 
@@ -166,7 +201,7 @@ def build_feature_indexes(
         "country": config.COUNTRY_COLUMN,
     }
 
-    indexes = {}
+    feature_indexes = {}
 
     for feature_name, column in feature_columns.items():
 
@@ -182,14 +217,19 @@ def build_feature_indexes(
         )
 
         print(
-            f"Building {feature_name} FAISS index..."
+            f"Building {feature_name} HNSW index..."
         )
 
-        indexes[
-            feature_name
-        ] = build_index(
+        index = build_index(
             embeddings
         )
+
+        feature_indexes[
+            feature_name
+        ] = {
+            "index": index,
+            "embeddings": embeddings
+        }
 
         print(
             f"{feature_name.capitalize()} index "
@@ -202,7 +242,24 @@ def build_feature_indexes(
             f"{embeddings.shape[1]}"
         )
 
-    return indexes
+        print(
+            f"{feature_name.capitalize()} "
+            f"HNSW M: {config.M}"
+        )
+
+        print(
+            f"{feature_name.capitalize()} "
+            f"efConstruction: "
+            f"{config.EF_CONSTRUCTION}"
+        )
+
+        print(
+            f"{feature_name.capitalize()} "
+            f"efSearch: "
+            f"{config.EF_SEARCH}"
+        )
+
+    return feature_indexes
 
 
 # ============================================================
@@ -210,31 +267,19 @@ def build_feature_indexes(
 # ============================================================
 
 def search_feature(
-    source_records,
-    column,
+    source_embeddings,
     index,
-    model
+    top_k
 ):
     """
-    Encode a source feature and search its corresponding
-    FAISS index.
+    Search a feature-specific HNSW index.
 
-    Returns:
-        similarities, indices
+    source_embeddings must already be normalized.
     """
 
-    embeddings = encode_feature(
-        records=source_records,
-        column=column,
-        model=model
-    )
-
-    # Normalization is required for HNSW embedding
-    # faiss.normalize_L2(embeddings)
-
     similarities, indices = index.search(
-        embeddings,
-        config.TOP_K
+        source_embeddings,
+        top_k
     )
 
     return (
@@ -244,57 +289,46 @@ def search_feature(
 
 
 # ============================================================
-# Candidate Generation
+# Candidate Pool Generation
 # ============================================================
 
-def generate_candidates(
-    source_records,
-    s1_records,
-    indexes,
-    model
+def generate_candidate_pool(
+    source_embeddings,
+    feature_indexes
 ):
     """
-    Generate candidate pairs using separate FAISS
-    indexes for name, address and country.
+    Generate a UNION of candidates retrieved independently
+    from name, address and country HNSW indexes.
 
-    Candidates from all feature indexes are combined
-    using the union of their candidate IDs.
+    Important:
+        This function ONLY performs candidate retrieval.
 
-    Each candidate contains:
-
-        name similarity
-        address similarity
-        country similarity
-        combined similarity
+        It does NOT calculate the final weighted score.
     """
 
-    # --------------------------------------------------------
-    # Feature configuration
-    # --------------------------------------------------------
-
-    feature_columns = {
-        "name": config.NAME_COLUMN,
-        "address": config.ADDRESS_COLUMN,
-        "country": config.COUNTRY_COLUMN,
+    feature_top_k = {
+        "name": config.NAME_TOP_K,
+        "address": config.ADDRESS_TOP_K,
+        "country": config.COUNTRY_TOP_K,
     }
-
-    # --------------------------------------------------------
-    # Search each feature independently
-    # --------------------------------------------------------
 
     feature_results = {}
 
-    for feature_name, column in feature_columns.items():
+    for feature_name, top_k in feature_top_k.items():
 
         print(
-            f"\nSearching {feature_name}..."
+            f"\nSearching {feature_name} "
+            f"TOP_K={top_k}..."
         )
 
         similarities, indices = search_feature(
-            source_records=source_records,
-            column=column,
-            index=indexes[feature_name],
-            model=model
+            source_embeddings=source_embeddings[
+                feature_name
+            ],
+            index=feature_indexes[
+                feature_name
+            ]["index"],
+            top_k=top_k
         )
 
         feature_results[
@@ -304,100 +338,201 @@ def generate_candidates(
             "indices": indices
         }
 
+    return feature_results
+
+
+# ============================================================
+# Actual Candidate Similarity
+# ============================================================
+
+def calculate_candidate_similarity(
+    source_index,
+    s1_index,
+    source_embeddings,
+    s1_embeddings
+):
+    """
+    Calculate the actual cosine similarity between one
+    source record and one S1 record.
+
+    Both vectors are already L2-normalized.
+
+    Therefore:
+
+        dot(source, s1)
+            =
+        cosine similarity
+    """
+
+    similarity = np.dot(
+        source_embeddings[source_index],
+        s1_embeddings[s1_index]
+    )
+
+    return float(similarity)
+
+
+# ============================================================
+# Candidate Generation
+# ============================================================
+
+def generate_candidates(
+    source_records,
+    s1_records,
+    feature_indexes,
+    model
+):
+    """
+    Generate candidate pairs.
+
+    Pipeline:
+
+        1. Encode source features.
+        2. Retrieve candidates using HNSW.
+        3. UNION candidates from all features.
+        4. Calculate actual name similarity.
+        5. Calculate actual address similarity.
+        6. Calculate actual country similarity.
+        7. Calculate weighted similarity.
+        8. Apply optional threshold.
+        9. Keep FINAL_TOP_K.
+
+    Unlike the previous implementation, a feature that did
+    not retrieve a candidate does NOT receive similarity 0.
+
+    The actual similarity is calculated for every candidate
+    in the union.
+    """
+
+    feature_columns = {
+        "name": config.NAME_COLUMN,
+        "address": config.ADDRESS_COLUMN,
+        "country": config.COUNTRY_COLUMN,
+    }
+
     # --------------------------------------------------------
-    # Combine candidates
+    # Encode source features ONCE
     # --------------------------------------------------------
 
-    CandidateKeys = config.candidatePairs
+    source_embeddings = {}
+
+    for feature_name, column in feature_columns.items():
+
+        print()
+        print(
+            f"Encoding source {feature_name}..."
+        )
+
+        source_embeddings[
+            feature_name
+        ] = encode_feature(
+            records=source_records,
+            column=column,
+            model=model
+        )
+
+    # --------------------------------------------------------
+    # Generate HNSW candidate pool
+    # --------------------------------------------------------
+
+    feature_results = generate_candidate_pool(
+        source_embeddings=source_embeddings,
+        feature_indexes=feature_indexes
+    )
 
     candidate_pairs = []
+
+    # --------------------------------------------------------
+    # Process each source record
+    # --------------------------------------------------------
 
     for source_index, source_record in enumerate(
         source_records
     ):
 
         # ----------------------------------------------------
-        # Candidate map
-        #
-        # key:
-        #     S1 record index
-        #
-        # value:
-        #     feature similarities
+        # UNION of candidates from all feature indexes
         # ----------------------------------------------------
 
-        candidates = {}
+        candidate_indices = set()
 
         for feature_name in feature_columns:
 
-            similarities = feature_results[
-                feature_name
-            ][
-                "similarities"
-            ][source_index]
-
             indices = feature_results[
                 feature_name
-            ][
-                "indices"
-            ][source_index]
+            ]["indices"][source_index]
 
-            for rank in range(
-                config.TOP_K
-            ):
-
-                s1_index = indices[rank]
-
-                similarity = similarities[rank]
+            for s1_index in indices:
 
                 if s1_index < 0:
                     continue
 
-                # ------------------------------------------------
-                # Create candidate entry if it does not exist
-                # ------------------------------------------------
-
-                if s1_index not in candidates:
-
-                    candidates[
-                        s1_index
-                    ] = {
-                        "name_similarity": 0.0,
-                        "address_similarity": 0.0,
-                        "country_similarity": 0.0,
-                    }
-
-                # ------------------------------------------------
-                # Store this feature's similarity
-                # ------------------------------------------------
-
-                candidates[
-                    s1_index
-                ][
-                    f"{feature_name}_similarity"
-                ] = float(
-                    similarity
+                candidate_indices.add(
+                    int(s1_index)
                 )
 
         # ----------------------------------------------------
-        # Calculate combined similarity
+        # Calculate ACTUAL similarity for every candidate
         # ----------------------------------------------------
 
+        print(
+            f"Candidate Indices {source_record} for ",
+            candidate_indices
+        )
         ranked_candidates = []
 
-        for s1_index, scores in candidates.items():
+        for s1_index in candidate_indices:
+            # print(s1_index)
+            # ------------------------------------------------
+            # Actual name similarity
+            # ------------------------------------------------
 
-            name_similarity = scores[
-                "name_similarity"
-            ]
+            name_similarity = (
+                calculate_candidate_similarity(
+                    source_index=source_index,
+                    s1_index=s1_index,
+                    source_embeddings=source_embeddings[
+                        "name"
+                    ],
+                    s1_embeddings=feature_indexes[
+                        "name"
+                    ]["embeddings"]
+                )
+            )
 
-            address_similarity = scores[
-                "address_similarity"
-            ]
+            # ------------------------------------------------
+            # Actual address similarity
+            # ------------------------------------------------
 
-            country_similarity = scores[
-                "country_similarity"
-            ]
+            address_similarity = (
+                calculate_candidate_similarity(
+                    source_index=source_index,
+                    s1_index=s1_index,
+                    source_embeddings=source_embeddings[
+                        "address"
+                    ],
+                    s1_embeddings=feature_indexes[
+                        "address"
+                    ]["embeddings"]
+                )
+            )
+
+            # ------------------------------------------------
+            # Actual country similarity
+            # ------------------------------------------------
+
+            country_similarity = (
+                calculate_candidate_similarity(
+                    source_index=source_index,
+                    s1_index=s1_index,
+                    source_embeddings=source_embeddings[
+                        "country"
+                    ],
+                    s1_embeddings=feature_indexes[
+                        "country"
+                    ]["embeddings"]
+                )
+            )
 
             # ------------------------------------------------
             # Weighted similarity
@@ -417,10 +552,9 @@ def generate_candidates(
             # ------------------------------------------------
             # Optional threshold
             # ------------------------------------------------
-
+            # print("combined_similarity : " + combined_similarity)
             if (
-                config.SIMILARITY_THRESHOLD
-                is not None
+                config.SIMILARITY_THRESHOLD is not None
                 and
                 combined_similarity
                 < config.SIMILARITY_THRESHOLD
@@ -438,7 +572,7 @@ def generate_candidates(
             )
 
         # ----------------------------------------------------
-        # Rank candidates by combined similarity
+        # Rank candidates
         # ----------------------------------------------------
 
         ranked_candidates.sort(
@@ -446,8 +580,11 @@ def generate_candidates(
             reverse=True
         )
 
+        print(
+            f" final RankedCandidates pair for {ranked_candidates}"
+        )
         # ----------------------------------------------------
-        # Keep final TOP_K candidates
+        # Keep FINAL_TOP_K
         # ----------------------------------------------------
 
         for rank, (
@@ -458,7 +595,7 @@ def generate_candidates(
             country_similarity
         ) in enumerate(
             ranked_candidates[
-                :config.TOP_K
+                :config.FINAL_TOP_K
             ],
             start=1
         ):
@@ -467,24 +604,20 @@ def generate_candidates(
                 s1_index
             ]
 
-            # ------------------------------------------------
-            # Create combined match pair
-            # ------------------------------------------------
-
             candidate_pair = {
 
                 # --------------------------------------------
                 # IDs
                 # --------------------------------------------
 
-                CandidateKeys[
+                config.candidatePairs[
                     config.S1_INDEX
                 ]: s1_record.get(
                     config.ENTITY_ID_COLUMN,
                     ""
                 ),
 
-                CandidateKeys[
+                config.candidatePairs[
                     config.MATCH_INDEX
                 ]: source_record.get(
                     config.ENTITY_ID_COLUMN,
@@ -495,14 +628,14 @@ def generate_candidates(
                 # Name
                 # --------------------------------------------
 
-                CandidateKeys[
+                config.candidatePairs[
                     config.S1_NAME
                 ]: s1_record.get(
                     config.NAME_COLUMN,
                     ""
                 ),
 
-                CandidateKeys[
+                config.candidatePairs[
                     config.MATCH_NAME
                 ]: source_record.get(
                     config.NAME_COLUMN,
@@ -513,14 +646,14 @@ def generate_candidates(
                 # Address
                 # --------------------------------------------
 
-                CandidateKeys[
+                config.candidatePairs[
                     config.S1_ADDRESS
                 ]: s1_record.get(
                     config.ADDRESS_COLUMN,
                     ""
                 ),
 
-                CandidateKeys[
+                config.candidatePairs[
                     config.MATCH_ADDRESS
                 ]: source_record.get(
                     config.ADDRESS_COLUMN,
@@ -531,14 +664,14 @@ def generate_candidates(
                 # Country
                 # --------------------------------------------
 
-                CandidateKeys[
+                config.candidatePairs[
                     config.S1_COUNTRY
                 ]: s1_record.get(
                     config.COUNTRY_COLUMN,
                     ""
                 ),
 
-                CandidateKeys[
+                config.candidatePairs[
                     config.MATCH_COUNTRY
                 ]: source_record.get(
                     config.COUNTRY_COLUMN,
@@ -562,11 +695,15 @@ def generate_candidates(
                 # Combined similarity
                 # --------------------------------------------
 
-                CandidateKeys[
+                config.candidatePairs[
                     config.SIMILARITY
                 ]: combined_similarity,
 
-                CandidateKeys[
+                # --------------------------------------------
+                # Rank
+                # --------------------------------------------
+
+                config.candidatePairs[
                     config.RANK
                 ]: rank,
             }
@@ -575,6 +712,9 @@ def generate_candidates(
                 candidate_pair
             )
 
+    print(
+        f" final candidates pair for {candidate_pairs}"
+    )
     return candidate_pairs
 
 
@@ -709,14 +849,14 @@ def main():
     )
 
     # --------------------------------------------------------
-    # Build separate FAISS indexes
+    # Build separate feature indexes
     # --------------------------------------------------------
 
     print(
-        "\nBuilding feature-specific indexes..."
+        "\nBuilding feature-specific HNSW indexes..."
     )
 
-    indexes = build_feature_indexes(
+    feature_indexes = build_feature_indexes(
         s1_records=s1_records,
         model=model
     )
@@ -757,7 +897,7 @@ def main():
         candidates = generate_candidates(
             source_records=source_records,
             s1_records=s1_records,
-            indexes=indexes,
+            feature_indexes=feature_indexes,
             model=model
         )
 

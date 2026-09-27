@@ -49,14 +49,20 @@ MODEL_NAME = HUGGING_FACE_MODEL_NAME
 
 # ---  HNSW Configurations ---
 # Number of connections per node in the graph
+import faiss
 M = 32
+METRIC = faiss.METRIC_INNER_PRODUCT
+EF_CONSTRUCTION  = 200
+EF_SEARCH  = 200
 
 # Number of candidates returned for each source record.
 #
 # Number of candidates retrieved from EACH FAISS index.
-TOP_K = 20
-TOP_K_PER_FEATURE = 20
+NAME_TOP_K = 50
+ADDRESS_TOP_K = 50
+COUNTRY_TOP_K = 20
 
+FINAL_TOP_K = 20
 # Batch size for embedding generation.
 #
 # Reduce this if GPU/RAM is limited.
@@ -82,7 +88,7 @@ COUNTRY_WEIGHT = 0.15
 # For initial experiments, keeping this as None is safer
 # because blocking should prioritize recall.
 COMBINED_SIMILARITY_THRESHOLD = None
-SIMILARITY_THRESHOLD = 0.8
+SIMILARITY_THRESHOLD = None
 
 # Example:
 # SIMILARITY_THRESHOLD = 0.50

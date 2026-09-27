@@ -91,5 +91,5 @@ def main(N) :
 
 if __name__ == "__main__" :
     # Number of records to take from each source
-    N = 1000
+    N = 500
     main(N)
